@@ -1169,7 +1169,19 @@ static int appletb_suspend(struct hid_device *hdev, pm_message_t message)
 	return 0;
 }
 
-static int appletb_reset_resume(struct hid_device *hdev)
+/*
+ * Used for both resume and reset-resume. On a reset-resume the device was
+ * reset and has lost its state; on a plain resume appletb_suspend() has
+ * explicitly turned both mode and display off (see the comment there). Either
+ * way the touch bar has to be switched back on here, so the two paths do the
+ * same thing.
+ *
+ * Registering this as .resume as well matters: .reset_resume only runs when
+ * the device actually needed a reset during resume. On an s2idle suspend the
+ * iBridge keeps its power and is not reset, so without a .resume callback
+ * nothing would ever turn the touch bar back on and it would stay dark.
+ */
+static int appletb_resume(struct hid_device *hdev)
 {
 	struct appletb_device *tb_dev =
 		appleib_get_drvdata(hid_get_drvdata(hdev), &appletb_hid_driver);
@@ -1231,7 +1243,8 @@ static struct hid_driver appletb_hid_driver = {
 	.input_configured = appletb_input_configured,
 #ifdef CONFIG_PM
 	.suspend = appletb_suspend,
-	.reset_resume = appletb_reset_resume,
+	.resume = appletb_resume,
+	.reset_resume = appletb_resume,
 #endif
 };
 

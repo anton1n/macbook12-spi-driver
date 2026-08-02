@@ -6,6 +6,44 @@ NOTE:
 -----
 The touchbar driver was refactored in late 2018; if you're upgrading from the `appletb` driver, please see the [Upgrading](#upgrading) section; if you're running a kernel before 4.16 then please check out the [legacy](../../tree/touchbar-driver-monolithic) branch instead.
 
+Fork changes:
+-------------
+This fork updates the iBridge/touch bar side for current kernels. The `applespi`
+keyboard/trackpad driver is unchanged (it has been in-tree since v5.3).
+
+* **Builds on clang/LTO kernels.** The `Makefile` reads `CONFIG_CC_IS_CLANG`
+  from the target kernel and switches to `LLVM=1` automatically, so distros
+  that ship a clang-built kernel (CachyOS, Arch `linux-llvm`, …) no longer fail
+  with `unrecognized command-line option '-mstack-alignment=8'`.
+* **Touch bar survives suspend.** `apple-ib-tb` registered only
+  `.reset_resume`, which the kernel calls solely when the USB device was reset
+  during resume. Under s2idle the iBridge keeps its power and is never reset, so
+  nothing undid the mode/display switch-off done at suspend and the touch bar
+  stayed dark until reboot. It now registers `.resume` as well.
+* **Ships the config the T1 needs at boot** — see
+  [Touch bar setup](#touch-bar-setup-t1--ibridge) below. Without it the touch
+  bar does not come up from a cold boot.
+* `dkms.conf` builds for the kernel being installed (`$kernelver`) rather than
+  the running one, so upgrades work.
+
+Verified building against 6.18.40 (clang), 6.18.41 (gcc) and 7.1.5 (gcc);
+runtime-tested on a MacBookPro14,3 on 6.18.40.
+
+Quick install:
+--------------
+```
+sudo ./install.sh              # or: sudo ./install.sh 6.18.41-1-lts
+```
+This installs the sources to `/usr/src/applespi-0.1`, builds and installs them
+via DKMS, drops the two config files described below into `/etc`, and runs
+`depmod`. It is safe to re-run. Reboot afterwards.
+
+To build without installing:
+```
+make                           # toolchain is auto-detected
+make KVERSION=6.18.41-1-lts    # build for a different kernel
+```
+
 Using it:
 ---------
 If you're on any MacBook or MacBook Pro other than MacBook8,1 (2015), and you're running a kernel before 4.11, then you'll need to boot the kernel with `intremap=nosid`. In all cases make sure you don't have `noapic` in your kernel options.
@@ -80,6 +118,77 @@ The touchbar and ambient-light-sensor (ALS) are part of the iBridge chip, and he
 The touchbar driver provides basic touchbar functionality (enabling the touchbar and switching between modes based on the FN key). The touchbar is automatically dimmed and later switched off if no (internal) keyboard, touchpad, or touchbar input is received for a period of time; any (internal) keyboard, touchpad, or touchbar input switches it back on. The timeouts till the touchbar is dimmed and turned off can be changed via the `idle_timeout` and `dim_timeout` module params or sysfs attributes (`/sys/class/input/input9/device/...`); they default to 5 min and 4.5 min, respectively. See also `modinfo apple_ib_tb`.
 
 The ALS driver exposes the ambient light sensor; if you have the `iio-sensor-proxy` installed then it should be recognized and handled automatically.
+
+Touch bar setup (T1 / iBridge):
+-------------------------------
+On T1 machines (MacBookPro13,* and 14,*) two pieces of configuration are
+required for the touch bar to work at boot. `install.sh` installs both; they are
+kept in the repo as `apple-ibridge.modprobe.conf` and `apple-ibridge.udev.rules`.
+
+**1. `/etc/modprobe.d/apple-ibridge.conf` — keep `hid-sensor-hub` away.**
+
+The iBridge exposes two HID interfaces, and `apple-ib-tb` needs *both*: one
+carries the touch bar **mode** field, the other the **display** on/dim/off field.
+The HID core tags the second one `HID_GROUP_SENSOR_HUB`, so `hid-sensor-hub`
+autoloads by modalias when the USB device enumerates — long before
+`apple_ibridge` comes up via its `APP7777` ACPI device — and binds it first.
+`apple-ib-tb` only activates once it has found both fields, so the result is a
+touch bar that probes cleanly, registers its input device, and stays completely
+black. Blacklisting the HID sensor stack lets `apple_ibridge` claim it. Nothing
+is lost: `apple-ib-als` exposes the same sensor as an IIO device.
+
+**2. `/etc/udev/rules.d/60-apple-ibridge.rules` — select USB configuration 1.**
+
+The iBridge has three USB configurations and the driver needs config 1
+(`APPLETB_BASIC_CONFIG`). When it comes up in another one, `appleib_hid_probe()`
+calls `usb_driver_set_configuration()` from inside its own probe; that is
+asynchronous, tears down every interface, drops the device to config 0, and only
+then selects config 1. Run mid-boot, while udev is coldplugging and both HID
+interfaces probe concurrently, this can leave the device stranded at config 0
+with no interfaces at all. Setting the configuration from udev at `add` time
+happens before any HID interface binds, so the driver's probe already sees
+config 1 and never reconfigures the device itself.
+
+If you want the touch bar always on and never dimmed:
+```
+echo 'options apple_ib_tb idle_timeout=-1 dim_timeout=-1' | sudo tee /etc/modprobe.d/apple-ib-tb.conf
+```
+
+### Troubleshooting
+
+Verify the whole chain:
+```
+cat /sys/bus/usb/devices/1-3/bConfigurationValue    # expect: 1
+for h in /sys/bus/hid/devices/*; do
+    echo "$(basename $h) -> $(basename $(readlink $h/driver 2>/dev/null) 2>/dev/null)"
+done                                                # both 05AC:8600 -> apple-ibridge-hid
+lsmod | grep -E 'apple_ib|hid_sensor'               # apple_ib_*, and no hid_sensor_*
+```
+
+If only *one* `05AC:8600` device is bound to `apple-ibridge-hid`, the other was
+stolen — check that the modprobe blacklist is in place. Note that `modprobe -R`
+ignores blacklists and is not a valid test; use the alias directly:
+```
+modprobe -n -v 'hid:b0003g0003v000005ACp00008600'   # should print nothing
+```
+
+**Touch bar wedged (dark despite the driver reporting success).** If it has been
+through a suspend without a matching resume, it can latch into an unresponsive
+state that survives a module reload — the USB writes all succeed and no error is
+logged, but the panel stays black. Force a full re-enumeration:
+```
+echo 0 | sudo tee /sys/bus/usb/devices/1-3/bConfigurationValue
+sleep 2
+echo 1 | sudo tee /sys/bus/usb/devices/1-3/bConfigurationValue
+```
+A reboot does the same. Worth knowing when testing suspend behaviour: starting
+from a wedged state makes the result meaningless.
+
+**Checking suspend/resume:**
+```
+sudo rtcwake -m mem -s 10
+dmesg | grep -iE 'Touchbar (suspended|resumed)'     # must show BOTH halves
+```
 
 Upgrading:
 ----------
